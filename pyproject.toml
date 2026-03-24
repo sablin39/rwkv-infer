@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rwkv7-infer"
+version = "0.0.1"
+description = "External SGLang integration package for RWKV7VL serving."
+requires-python = ">=3.12"
+dependencies = [
+    "sglang==0.5.9",
+    "transformers==5.3.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
