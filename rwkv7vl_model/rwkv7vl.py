@@ -1,5 +1,4 @@
 import logging
-import warnings
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -17,188 +16,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 from fla.models.rwkv7 import RWKV7Config
-from fla.models.rwkv7.modeling_rwkv7 import RWKV7Block
+from rwkv7_backend import RWKV7Block, RWKV7SGLangCache
 
 logger = logging.getLogger(__name__)
-
-
-class RWKV7SGLangCache:
-    """Adapt SGLang's Mamba pool tensors to the cache interface expected by `fla`."""
-
-    def __init__(
-        self,
-        *,
-        num_layers: int,
-        hidden_size: int,
-        req_to_token_pool,
-        req_pool_indices: torch.Tensor,
-        write_indices: Optional[torch.Tensor] = None,
-        extend_prefix_lens: Optional[List[int]] = None,
-    ) -> None:
-        if not hasattr(req_to_token_pool, "get_mamba_indices") or not hasattr(
-            req_to_token_pool, "mamba2_layer_cache"
-        ):
-            raise TypeError(
-                "RWKV7VL requires SGLang's hybrid req-to-token pool with Mamba cache support."
-            )
-
-        self.num_layers = num_layers
-        self.hidden_size = hidden_size
-        self.req_to_token_pool = req_to_token_pool
-        self.req_pool_indices = req_pool_indices.to(dtype=torch.int64)
-        self.read_indices = req_to_token_pool.get_mamba_indices(
-            self.req_pool_indices
-        ).to(dtype=torch.int64)
-        self.write_indices = (
-            write_indices.to(device=self.read_indices.device, dtype=torch.int64)
-            if write_indices is not None
-            else self.read_indices
-        )
-        self.states: List[Optional[dict]] = [None] * num_layers
-
-        self.prefix_mask: Optional[torch.Tensor]
-        if extend_prefix_lens is None:
-            self.prefix_mask = None
-        else:
-            self.prefix_mask = torch.as_tensor(
-                [prefix_len > 0 for prefix_len in extend_prefix_lens],
-                device=self.read_indices.device,
-                dtype=torch.bool,
-            )
-
-    def __len__(self) -> int:
-        return self.num_layers
-
-    def _layer_cache(self, layer_idx: int):
-        return self.req_to_token_pool.mamba2_layer_cache(layer_idx)
-
-    def _clone_layer_state(self, layer_idx: int) -> dict:
-        layer_cache = self._layer_cache(layer_idx)
-
-        packed_conv = layer_cache.conv[0].index_select(0, self.read_indices).clone()
-        if packed_conv.dim() == 3:
-            if packed_conv.shape[-1] != 1:
-                raise RuntimeError(
-                    f"Unexpected packed RWKV conv cache shape: {tuple(packed_conv.shape)}"
-                )
-            packed_conv = packed_conv.squeeze(-1)
-        if packed_conv.dim() != 2 or packed_conv.shape[1] != 2 * self.hidden_size:
-            raise RuntimeError(
-                f"Unexpected packed RWKV conv cache shape: {tuple(packed_conv.shape)}"
-            )
-
-        recurrent_state = layer_cache.temporal.index_select(0, self.read_indices).clone()
-        attn_shift, ffn_shift = packed_conv.split(self.hidden_size, dim=1)
-
-        state = {
-            "recurrent_state": recurrent_state,
-            "conv_state": attn_shift,
-            "ffn_state": ffn_shift,
-        }
-
-        if self.prefix_mask is not None and not bool(self.prefix_mask.all()):
-            state["recurrent_state"][~self.prefix_mask] = 0
-            state["conv_state"][~self.prefix_mask] = 0
-            state["ffn_state"][~self.prefix_mask] = 0
-
-        return state
-
-    def __getitem__(self, layer_idx: int):
-        state = self.states[layer_idx]
-        if state is None:
-            state = self._clone_layer_state(layer_idx)
-            self.states[layer_idx] = state
-        return state
-
-    def update(
-        self,
-        recurrent_state=None,
-        conv_state=None,
-        ffn_state=None,
-        attn_state=None,
-        layer_idx=None,
-        offset=0,
-        **kwargs,
-    ):
-        del attn_state, offset, kwargs
-        state = self[layer_idx]
-        if recurrent_state is not None:
-            state["recurrent_state"] = recurrent_state
-        if conv_state is not None:
-            state["conv_state"] = conv_state
-        if ffn_state is not None:
-            state["ffn_state"] = ffn_state
-
-    def _packed_conv_state(self, layer_idx: int) -> Optional[torch.Tensor]:
-        state = self[layer_idx]
-        conv_state = state.get("conv_state")
-        ffn_state = state.get("ffn_state")
-        if conv_state is None or ffn_state is None:
-            return None
-
-        packed = torch.cat([conv_state, ffn_state], dim=1)
-        target = self._layer_cache(layer_idx).conv[0]
-        if target.dim() == 3:
-            packed = packed.unsqueeze(-1)
-        return packed.to(device=target.device, dtype=target.dtype)
-
-    def _temporal_state(self, layer_idx: int) -> Optional[torch.Tensor]:
-        recurrent_state = self[layer_idx].get("recurrent_state")
-        if recurrent_state is None:
-            return None
-        target = self._layer_cache(layer_idx).temporal
-        return recurrent_state.to(device=target.device, dtype=target.dtype)
-
-    @staticmethod
-    def _index_copy_if_needed(
-        target: torch.Tensor,
-        indices: Optional[torch.Tensor],
-        values: Optional[torch.Tensor],
-    ) -> None:
-        if indices is None or values is None or indices.numel() == 0:
-            return
-        target.index_copy_(0, indices, values)
-
-    def commit(
-        self,
-        *,
-        track_indices: Optional[torch.Tensor] = None,
-        track_mask: Optional[torch.Tensor] = None,
-    ) -> None:
-        tracked_indices = None
-        if track_indices is not None and track_mask is not None:
-            track_indices = track_indices.to(
-                device=self.read_indices.device, dtype=torch.int64
-            )
-            track_mask = track_mask.to(
-                device=self.read_indices.device, dtype=torch.bool
-            )
-            if bool(track_mask.any()):
-                tracked_indices = track_indices[track_mask]
-
-        for layer_idx in range(self.num_layers):
-            if self.states[layer_idx] is None:
-                continue
-
-            layer_cache = self._layer_cache(layer_idx)
-            packed = self._packed_conv_state(layer_idx)
-            temporal = self._temporal_state(layer_idx)
-
-            self._index_copy_if_needed(layer_cache.conv[0], self.write_indices, packed)
-            self._index_copy_if_needed(
-                layer_cache.temporal, self.write_indices, temporal
-            )
-
-            if tracked_indices is None:
-                continue
-
-            tracked_packed = packed[track_mask] if packed is not None else None
-            tracked_temporal = temporal[track_mask] if temporal is not None else None
-            self._index_copy_if_needed(layer_cache.conv[0], tracked_indices, tracked_packed)
-            self._index_copy_if_needed(
-                layer_cache.temporal, tracked_indices, tracked_temporal
-            )
-
 
 class VisualAdapter(nn.Module):
     """Project vision encoder outputs into RWKV embedding space."""
@@ -233,12 +53,9 @@ class RWKV7LanguageModel(nn.Module):
         self.num_layers = config.num_hidden_layers
 
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self.layers = nn.ModuleList(
-                [RWKV7Block(config, layer_idx) for layer_idx in range(self.num_layers)]
-            )
+        self.layers = nn.ModuleList(
+            [RWKV7Block(config, layer_idx) for layer_idx in range(self.num_layers)]
+        )
 
         use_fuse = getattr(config, "fuse_norm", False)
         norm_bias = getattr(config, "norm_bias", True)
@@ -320,8 +137,6 @@ class RWKV7LanguageModel(nn.Module):
             dtype=torch.long,
         )
         track_cache = RWKV7SGLangCache(
-            num_layers=self.num_layers,
-            hidden_size=self.hidden_size,
             req_to_token_pool=forward_batch.req_to_token_pool,
             req_pool_indices=forward_batch.req_pool_indices[selected_req_indices_tensor],
             write_indices=torch.as_tensor(
@@ -334,16 +149,13 @@ class RWKV7LanguageModel(nn.Module):
 
         v_first = torch.zeros_like(track_hidden_states)
         for layer in self.layers:
-            track_hidden_states, _attn, track_cache, v_first = layer(
+            track_hidden_states, v_first = layer(
                 track_hidden_states,
-                past_key_values=track_cache,
-                use_cache=True,
+                cache=track_cache,
                 v_first=v_first,
                 cu_seqlens=cu_seqlens,
                 **kwargs,
             )
-
-        track_cache.commit()
 
     @torch.no_grad()
     def forward(
@@ -364,11 +176,15 @@ class RWKV7LanguageModel(nn.Module):
             return hidden_states
 
         cache = RWKV7SGLangCache(
-            num_layers=self.num_layers,
-            hidden_size=self.hidden_size,
             req_to_token_pool=forward_batch.req_to_token_pool,
             req_pool_indices=forward_batch.req_pool_indices,
             extend_prefix_lens=forward_batch.extend_prefix_lens_cpu if is_extend else None,
+            track_indices=getattr(forward_batch, "mamba_track_indices", None)
+            if is_decode
+            else None,
+            track_mask=getattr(forward_batch, "mamba_track_mask", None)
+            if is_decode
+            else None,
         )
 
         if is_extend:
@@ -393,23 +209,15 @@ class RWKV7LanguageModel(nn.Module):
 
         v_first = torch.zeros_like(hidden_states)
         for layer in self.layers:
-            hidden_states, _attn, cache, v_first = layer(
+            hidden_states, v_first = layer(
                 hidden_states,
-                past_key_values=cache,
-                use_cache=True,
+                cache=cache,
                 v_first=v_first,
                 cu_seqlens=cu_seqlens,
                 **kwargs,
             )
 
         hidden_states = self.norm(hidden_states)
-        if is_decode:
-            cache.commit(
-                track_indices=getattr(forward_batch, "mamba_track_indices", None),
-                track_mask=getattr(forward_batch, "mamba_track_mask", None),
-            )
-        else:
-            cache.commit()
 
         if is_extend:
             hidden_states = hidden_states.squeeze(0)

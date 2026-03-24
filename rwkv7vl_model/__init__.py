@@ -7,15 +7,7 @@ _RWKV7VL_ARCH = "RWKV7VLForConditionalGeneration"
 
 
 class _RWKV7Mamba2ConfigAdapter:
-    """ModelRunner-facing view over configs that only advertise mamba2 cache params.
-
-    SGLang's hybrid recurrent memory profiler currently assumes a non-empty
-    `full_attention_layer_ids` list when sizing per-token KV cache. RWKV7VL is
-    fully recurrent, so the underlying HF config correctly reports no full
-    attention layers. We keep that source-of-truth config untouched and expose a
-    minimal runner-only adapter here so ModelRunner can finish sizing its hybrid
-    pools without upstream SGLang edits.
-    """
+    """ModelRunner-facing view over configs that only advertise mamba2 cache params."""
 
     def __init__(self, config):
         self._config = config
@@ -25,12 +17,19 @@ class _RWKV7Mamba2ConfigAdapter:
 
     @property
     def full_attention_layer_ids(self):
-        layer_ids = list(getattr(self._config, "full_attention_layer_ids", []) or [])
-        return layer_ids if layer_ids else [0]
+        return list(getattr(self._config, "full_attention_layer_ids", []) or [])
 
     @property
     def linear_layer_ids(self):
-        return getattr(self._config, "linear_layer_ids", [])
+        layer_ids = getattr(self._config, "linear_layer_ids", None)
+        if layer_ids is not None:
+            return list(layer_ids)
+
+        text_config = getattr(self._config, "text_config", None)
+        num_layers = getattr(
+            text_config, "num_hidden_layers", getattr(self._config, "num_hidden_layers", 0)
+        )
+        return list(range(num_layers))
 
 
 def _should_defer_patch() -> bool:
@@ -210,7 +209,116 @@ def patch_model_runner_mamba2_config() -> None:
     logger.info("Patched ModelRunner.mamba2_config for RWKV7VL external model support")
 
 
+def patch_model_runner_pure_recurrent_memory() -> None:
+    try:
+        from sglang.srt.distributed.parallel_state import get_world_group
+        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+            ModelRunnerKVCacheMixin,
+        )
+        from sglang.srt.utils.common import get_available_gpu_memory
+    except Exception as exc:
+        logger.warning(
+            "Failed to import ModelRunnerKVCacheMixin for RWKV7VL patch: %s", exc
+        )
+        return
+
+    patch_flag = "_rwkv7vl_pure_recurrent_memory_patch_applied"
+    if getattr(ModelRunnerKVCacheMixin, patch_flag, False):
+        return
+
+    original_profile = ModelRunnerKVCacheMixin.profile_max_num_token
+    original_handle = ModelRunnerKVCacheMixin.handle_max_mamba_cache
+
+    def _is_pure_recurrent_rwkv7vl_runner(model_runner) -> bool:
+        if not _should_patch_rwkv7vl(model_runner):
+            return False
+        config = getattr(model_runner, "mambaish_config", None)
+        if config is None:
+            return False
+        return len(list(getattr(config, "full_attention_layer_ids", []) or [])) == 0
+
+    def _patched_handle_max_mamba_cache(self, total_rest_memory):
+        if not _is_pure_recurrent_rwkv7vl_runner(self):
+            return original_handle(self, total_rest_memory)
+
+        config = self.mambaish_config
+        server_args = self.server_args
+        assert config is not None
+
+        if not self.spec_algorithm.is_none():
+            assert server_args.speculative_num_draft_tokens is not None
+            assert server_args.max_running_requests is not None
+
+            max_running_requests = server_args.max_running_requests // (
+                self.dp_size if server_args.enable_dp_attention else 1
+            )
+            mamba_state_intermediate_size = (
+                config.mamba2_cache_params.mamba_cache_per_req
+                * max_running_requests
+                * server_args.speculative_num_draft_tokens
+            )
+            total_rest_memory = total_rest_memory - (
+                mamba_state_intermediate_size / (1 << 30)
+            )
+
+        if server_args.max_mamba_cache_size is not None:
+            server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
+                server_args.dp_size if server_args.enable_dp_attention else 1
+            )
+        elif (
+            server_args.disable_radix_cache
+            and server_args.max_running_requests is not None
+        ):
+            server_args.max_mamba_cache_size = server_args.max_running_requests // (
+                server_args.dp_size if server_args.enable_dp_attention else 1
+            )
+        else:
+            assert config.mamba2_cache_params.mamba_cache_per_req > 0
+            server_args.max_mamba_cache_size = int(
+                (total_rest_memory * (1 << 30))
+                // config.mamba2_cache_params.mamba_cache_per_req
+            )
+
+        mamba_state_memory = (
+            server_args.max_mamba_cache_size
+            * config.mamba2_cache_params.mamba_cache_per_req
+            / (1 << 30)
+        )
+        return total_rest_memory - mamba_state_memory
+
+    def _patched_profile_max_num_token(self, total_gpu_memory):
+        if not _is_pure_recurrent_rwkv7vl_runner(self):
+            return original_profile(self, total_gpu_memory)
+
+        available_gpu_memory = get_available_gpu_memory(
+            self.device,
+            self.gpu_id,
+            distributed=get_world_group().world_size > 1,
+            cpu_group=get_world_group().cpu_group,
+        )
+
+        rest_memory = available_gpu_memory - total_gpu_memory * (
+            1 - self.mem_fraction_static
+        )
+        rest_memory = self.handle_max_mamba_cache(rest_memory)
+        if rest_memory < 0:
+            return 0
+
+        # Pure recurrent RWKV tracks token history for radix matching but does not
+        # need per-token KV tensors. One token slot per context position per tracked
+        # recurrent state is a practical upper bound for prefix-cache bookkeeping.
+        return int(self.server_args.max_mamba_cache_size * self.model_config.context_len)
+
+    ModelRunnerKVCacheMixin.handle_max_mamba_cache = _patched_handle_max_mamba_cache
+    ModelRunnerKVCacheMixin.profile_max_num_token = _patched_profile_max_num_token
+    setattr(ModelRunnerKVCacheMixin, patch_flag, True)
+    logger.info(
+        "Patched ModelRunnerKVCacheMixin for RWKV7VL pure recurrent memory sizing"
+    )
+
+
 force_rwkv7vl_extra_buffer()
 patch_schedule_batch_tracking()
 patch_mamba_attn_backend_tracking()
 patch_model_runner_mamba2_config()
+patch_model_runner_pure_recurrent_memory()
