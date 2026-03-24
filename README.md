@@ -1,4 +1,4 @@
-# RWKV7VL External SGLang Integration
+# RWKV7 External SGLang Integration
 
 This repository contains the external-package integration for serving RWKV7VL with SGLang without modifying upstream `sglang` source.
 
@@ -46,13 +46,15 @@ The same launch flow is also wrapped in `./benchmarks/launch_server.sh`.
 
 ## Benchmarks
 
-The repository includes ready-to-run benchmark helpers under `./benchmarks`. They default to:
+The repository includes a small set of ready-to-run helpers under `./benchmarks` for the core server flow: launch the server, drive batched requests, and optionally profile that same serving path. They default to:
 
 - `MODEL_PATH=./ckpt/rwkv-23552`
 - `TOKENIZER_PATH=./ckpt/rwkv-23552`
 - `HOST=127.0.0.1`
 - `PORT=31000`
 - `PYTHONPATH=./src:$PYTHONPATH`
+- `DATASET_NAME=random`
+- `GSP_NUM_TURNS=4` when `DATASET_NAME=generated-shared-prefix`
 - the external RWKV7VL package environment variables required by SGLang
 
 If you add more exports under `./ckpt`, override `MODEL_PATH` and `TOKENIZER_PATH` when launching the server or benchmarks.
@@ -65,55 +67,49 @@ Run the server first:
 
 Then use the benchmark scripts from the repo root.
 
-- `./benchmarks/bench_cache_reuse.sh`
-  Stress-tests shared-prefix cache reuse with `generated-shared-prefix`. This is the most relevant built-in test for validating recurrent cache reuse and radix-cache behavior.
-  The script intentionally does not pass `--tokenize-prompt`, because the current `sglang.bench_serving` implementation asserts that `generated-shared-prefix` stays in text-prompt mode.
+- `./benchmarks/bench_serving.sh`
+  Runs the online serving benchmark used for repeated batched requests.
+  By default it uses `DATASET_NAME=random` as a lightweight text-only baseline.
+  Set `DATASET_NAME=generated-shared-prefix` to exercise shared-prefix, multi-round conversations with `GSP_NUM_TURNS=4` by default.
+  Set `DATASET_NAME=image` for synthetic image-text traffic or `DATASET_NAME=mmmu` for a real image-text benchmark loaded from Hugging Face.
 
-- `./benchmarks/bench_random_throughput.sh`
-  Measures text-only serving throughput and concurrency without shared prefixes. Use it as the baseline against the cache-reuse benchmark.
-
-- `./benchmarks/bench_cache_hit_rate.sh`
-  Runs `bench_one_batch_server` against the live server with a configurable synthetic cache hit rate. Set `CACHE_HIT_RATE=0.0` and `CACHE_HIT_RATE=0.9` to estimate the payoff from cache reuse.
-
-- `./benchmarks/profile_prefill.sh`
-  Profiles one-batch prefill latency across several batch sizes and prompt lengths.
-
-- `./benchmarks/profile_decode.sh`
-  Profiles decode latency and logs per-step timing so stalls in the recurrent-state path are easier to spot.
-
-- `./benchmarks/profile_server.sh`
-  Captures CPU, GPU, and memory traces from the running SGLang server into `./sglang_profile`.
-
-- `./benchmarks/bench_image_serving.sh`
-  Stress-tests the multimodal serving path with synthetic image requests.
-
-- `./benchmarks/bench_offline_gsp.sh`
-  Launches an offline throughput run with shared prefixes for cold-start or isolated throughput measurements.
+- `./benchmarks/profile_serving.sh`
+  Wraps the same online serving benchmark with `--profile`, so traces come from the exact workload selected via `DATASET_NAME` instead of a separate microbenchmark.
+  The launcher exports `SGLANG_TORCH_PROFILER_DIR` by default, so profiling works out of the box when the server is started with `./benchmarks/launch_server.sh`.
 
 Examples:
 
 ```bash
-# Compare shared-prefix reuse against random-text throughput.
-./benchmarks/bench_cache_reuse.sh
-./benchmarks/bench_random_throughput.sh
+# Default random-text serving benchmark.
+./benchmarks/bench_serving.sh
 
-# Compare no-cache and high-cache synthetic hit rates.
-CACHE_HIT_RATE=0.0 ./benchmarks/bench_cache_hit_rate.sh
-CACHE_HIT_RATE=0.9 ./benchmarks/bench_cache_hit_rate.sh
+# Multi-round shared-prefix serving benchmark.
+DATASET_NAME=generated-shared-prefix ./benchmarks/bench_serving.sh
 
-# Increase concurrency on the random-text throughput benchmark.
-MAX_CONCURRENCY=128 REQUEST_RATE=32 ./benchmarks/bench_random_throughput.sh
+# Increase turns on the shared-prefix benchmark.
+DATASET_NAME=generated-shared-prefix GSP_NUM_TURNS=8 ./benchmarks/bench_serving.sh
 
-# Save server traces to a custom output directory.
-OUTPUT_DIR=./profiles/rwkv7vl ./benchmarks/profile_server.sh
+# Synthetic image-text traffic.
+DATASET_NAME=image IMAGE_COUNT=1 IMAGE_RESOLUTION=360p ./benchmarks/bench_serving.sh
+
+# Real image-text prompts from MMMU Math.
+DATASET_NAME=mmmu NUM_PROMPTS=32 ./benchmarks/bench_serving.sh
+
+# Profile the same multi-round workload and save traces elsewhere.
+DATASET_NAME=generated-shared-prefix PROFILE_OUTPUT_DIR=./profiles/rwkv7vl ./benchmarks/profile_serving.sh
 ```
 
 Most scripts accept extra CLI flags and common environment overrides. For example:
 
 ```bash
 PORT=32000 MODEL_PATH=/path/to/ckpt/rwkv-23552 ./benchmarks/launch_server.sh --log-requests
-PORT=32000 ./benchmarks/bench_cache_reuse.sh --profile --profile-output-dir ./profiles/cache
+PORT=32000 ./benchmarks/profile_serving.sh --profile-stages prefill decode
 ```
+
+Notes:
+
+- `DATASET_NAME=image` uses synthetic images generated by SGLang for multimodal load testing.
+- `DATASET_NAME=mmmu` downloads the `MMMU/MMMU` Math test split from Hugging Face on first use.
 
 ## Source Of Truth
 
