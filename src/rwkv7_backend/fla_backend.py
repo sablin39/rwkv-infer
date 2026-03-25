@@ -17,10 +17,17 @@ from fla.ops.rwkv7.fused_k_update import fused_k_rwkv7
 from fla.ops.rwkv7.gate_output_correction import gate_output_correction
 
 from .cache import RWKV7LayerState, RWKV7SGLangCache
-
+from .jit_recurrent import (
+    RWKV7_JIT_MAX_HEAD_DIM,
+    RWKV7_JIT_SUPPORTED_DTYPES,
+    run_rwkv7_decode_jit,
+    run_rwkv7_prefill_jit,
+)
 
 from transformers.modeling_layers import GradientCheckpointingLayer
 
+
+RWKV7_W_SCALE = -0.6065306597126334
 
 
 class RWKV7Attention(nn.Module):
@@ -40,6 +47,8 @@ class RWKV7Attention(nn.Module):
         fuse_norm: bool = False,
         value_dim: int | None = None,
         num_hidden_layers: int | None = None,
+        prefill_backend_name: str = "fla",
+        decode_backend_name: str = "fla",
         **kwargs,
     ) -> None:
         super().__init__()
@@ -96,6 +105,8 @@ class RWKV7Attention(nn.Module):
         self.layer_idx = layer_idx
         self.num_hidden_layers = num_hidden_layers
         self.fuse_norm = fuse_norm
+        self.prefill_backend_name = prefill_backend_name
+        self.decode_backend_name = decode_backend_name
 
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
         self.x_r = nn.Parameter(torch.zeros(1, 1, hidden_size))
@@ -244,6 +255,121 @@ class RWKV7Attention(nn.Module):
         nn.init.orthogonal_(weight_fp32, gain=gain)
         weight.data.copy_(weight_fp32.to(original_dtype))
 
+    def _resolve_runtime_backend(
+        self,
+        backend_phase: str | None,
+        seq_len: int,
+    ) -> tuple[str, str]:
+        if backend_phase is None:
+            backend_phase = "decode" if seq_len == 1 else "prefill"
+        if backend_phase not in {"prefill", "decode"}:
+            raise ValueError(
+                f"Unsupported RWKV7 backend phase '{backend_phase}'. Expected 'prefill' or 'decode'."
+            )
+        backend_name = (
+            self.prefill_backend_name
+            if backend_phase == "prefill"
+            else self.decode_backend_name
+        )
+        return backend_phase, backend_name
+
+    def _run_fla_recurrent_backend(
+        self,
+        *,
+        seq_len: int,
+        r: torch.Tensor,
+        w: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kk: torch.Tensor,
+        a: torch.Tensor,
+        recurrent_state: torch.Tensor | None,
+        cu_seqlens: torch.LongTensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.training or seq_len >= 64:
+            return chunk_rwkv7(
+                r=r,
+                w=w,
+                k=k,
+                v=v,
+                a=-kk,
+                b=kk * a,
+                scale=1.0,
+                initial_state=recurrent_state,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+                safe_gate=True,
+                chunk_size=64,
+            )
+
+        return fused_mul_recurrent_rwkv7(
+            r=r,
+            w=w,
+            k=k,
+            v=v,
+            kk=kk,
+            a=a,
+            scale=1.0,
+            initial_state=recurrent_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+        )
+
+    def _run_jit_recurrent_backend(
+        self,
+        *,
+        backend_phase: str,
+        r: torch.Tensor,
+        w_logits: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kk: torch.Tensor,
+        a: torch.Tensor,
+        recurrent_state: torch.Tensor | None,
+        cu_seqlens: torch.LongTensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.training:
+            raise RuntimeError(
+                "RWKV7 JIT backend is inference-only and cannot be used in training mode."
+            )
+        if self.head_v_dim != self.head_dim:
+            raise RuntimeError(
+                "RWKV7 JIT backend requires square per-head state "
+                f"(head_dim == head_v_dim), got {self.head_dim} vs {self.head_v_dim}."
+            )
+        if self.head_dim > RWKV7_JIT_MAX_HEAD_DIM:
+            raise RuntimeError(
+                f"RWKV7 JIT backend only supports head_dim <= {RWKV7_JIT_MAX_HEAD_DIM}, got {self.head_dim}."
+            )
+        if r.dtype not in RWKV7_JIT_SUPPORTED_DTYPES:
+            raise RuntimeError(
+                f"RWKV7 JIT backend only supports dtypes {RWKV7_JIT_SUPPORTED_DTYPES}, got {r.dtype}."
+            )
+
+        if backend_phase == "prefill":
+            return run_rwkv7_prefill_jit(
+                r=r,
+                w_logits=w_logits,
+                k=k,
+                v=v,
+                kk=kk,
+                a=a,
+                initial_state=recurrent_state,
+                cu_seqlens=cu_seqlens,
+            )
+
+        if cu_seqlens is not None:
+            raise RuntimeError("RWKV7 JIT decode does not accept cu_seqlens.")
+        return run_rwkv7_decode_jit(
+            r=r,
+            w_logits=w_logits,
+            k=k,
+            v=v,
+            kk=kk,
+            a=a,
+            initial_state=recurrent_state,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -252,8 +378,13 @@ class RWKV7Attention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         v_first: torch.Tensor | None = None,
         cu_seqlens: torch.LongTensor | None = None,
+        backend_phase: str | None = None,
     ) -> tuple[torch.Tensor, RWKV7LayerState | None, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
+        backend_phase, runtime_backend = self._resolve_runtime_backend(
+            backend_phase,
+            seq_len,
+        )
         if attention_mask is not None:
             if attention_mask.dim() != 2:
                 raise ValueError(
@@ -290,7 +421,7 @@ class RWKV7Attention(nn.Module):
         )
 
         r = self.r_proj(xr)
-        w = -0.6065306597126334 * self.w_lora(xw).sigmoid()
+        w_logits = self.w_lora(xw)
 
         k = self.k_proj(xk)
         v = self.v_proj(xv)
@@ -318,38 +449,35 @@ class RWKV7Attention(nn.Module):
         if am is not None:
             v = v * am
 
-        r, w, k, a = map(
+        r, w_logits, k, a = map(
             lambda x: rearrange(x, "b t (h d) -> b t h d", d=self.head_dim),
-            (r, w, k, a),
+            (r, w_logits, k, a),
         )
         v = rearrange(v, "b t (h d) -> b t h d", d=self.head_v_dim)
 
-        if self.training or seq_len >= 64:
-            o, recurrent_state = chunk_rwkv7(
+        if runtime_backend == "jit":
+            o, recurrent_state = self._run_jit_recurrent_backend(
+                backend_phase=backend_phase,
                 r=r,
-                w=w,
+                w_logits=w_logits,
                 k=k,
                 v=v,
-                a=-kk,
-                b=kk * a,
-                scale=1.0,
-                initial_state=recurrent_state,
-                output_final_state=True,
+                kk=kk,
+                a=a,
+                recurrent_state=recurrent_state,
                 cu_seqlens=cu_seqlens,
-                safe_gate=True,
-                chunk_size=64,
             )
         else:
-            o, recurrent_state = fused_mul_recurrent_rwkv7(
+            w = RWKV7_W_SCALE * w_logits.sigmoid()
+            o, recurrent_state = self._run_fla_recurrent_backend(
+                seq_len=seq_len,
                 r=r,
                 w=w,
                 k=k,
                 v=v,
                 kk=kk,
                 a=a,
-                scale=1.0,
-                initial_state=recurrent_state,
-                output_final_state=True,
+                recurrent_state=recurrent_state,
                 cu_seqlens=cu_seqlens,
             )
 
@@ -463,7 +591,14 @@ class RWKV7FeedForward(nn.Module):
 
 
 class RWKV7Block(GradientCheckpointingLayer):
-    def __init__(self, config: RWKV7Config, layer_idx: int) -> None:
+    def __init__(
+        self,
+        config: RWKV7Config,
+        layer_idx: int,
+        *,
+        prefill_backend_name: str = "fla",
+        decode_backend_name: str = "fla",
+    ) -> None:
         super().__init__()
 
         if config.attn is not None and layer_idx in config.attn["layers"]:
@@ -473,6 +608,8 @@ class RWKV7Block(GradientCheckpointingLayer):
 
         self.config = config
         self.layer_idx = layer_idx
+        self.prefill_backend_name = prefill_backend_name
+        self.decode_backend_name = decode_backend_name
 
         if config.norm_first and layer_idx == 0:
             self.pre_norm = (LayerNorm if config.fuse_norm else nn.LayerNorm)(
@@ -499,6 +636,8 @@ class RWKV7Block(GradientCheckpointingLayer):
             layer_idx=layer_idx,
             value_dim=config.value_dim[layer_idx],
             num_hidden_layers=config.num_hidden_layers,
+            prefill_backend_name=prefill_backend_name,
+            decode_backend_name=decode_backend_name,
         )
         self.ffn_norm = (LayerNorm if config.fuse_norm else nn.LayerNorm)(
             config.hidden_size,
@@ -522,6 +661,7 @@ class RWKV7Block(GradientCheckpointingLayer):
         attention_mask: torch.Tensor | None = None,
         v_first: torch.Tensor | None = None,
         cu_seqlens: torch.LongTensor | None = None,
+        backend_phase: str | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del kwargs
@@ -538,6 +678,7 @@ class RWKV7Block(GradientCheckpointingLayer):
             attention_mask=attention_mask,
             v_first=v_first,
             cu_seqlens=cu_seqlens,
+            backend_phase=backend_phase,
         )
 
         if self.config.fuse_norm:
