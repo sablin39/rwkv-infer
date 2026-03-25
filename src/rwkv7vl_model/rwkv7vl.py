@@ -3,8 +3,8 @@ from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
-from transformers import Qwen3_5VisionModel
 
+from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -14,11 +14,38 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 
 from fla.models.rwkv7 import RWKV7Config
-from rwkv7_backend import RWKV7Block, RWKV7SGLangCache
+from rwkv7_backend import (
+    RWKV7SGLangCache,
+    build_rwkv7_block,
+    resolve_rwkv7_backend_name,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_vision_config(vision_config) -> Qwen3VLVisionConfig:
+    if isinstance(vision_config, Qwen3VLVisionConfig):
+        config = vision_config
+    else:
+        if isinstance(vision_config, dict):
+            raw_config = dict(vision_config)
+        elif hasattr(vision_config, "to_dict"):
+            raw_config = vision_config.to_dict()
+        else:
+            raw_config = {}
+
+        for key in ("architectures", "model_type", "dtype"):
+            raw_config.pop(key, None)
+        raw_config.setdefault("deepstack_visual_indexes", [])
+        config = Qwen3VLVisionConfig(**raw_config)
+
+    if config.deepstack_visual_indexes is None:
+        config.deepstack_visual_indexes = []
+    return config
+
 
 class VisualAdapter(nn.Module):
     """Project vision encoder outputs into RWKV embedding space."""
@@ -49,12 +76,21 @@ class RWKV7LanguageModel(nn.Module):
     def __init__(self, config: RWKV7Config):
         super().__init__()
         self.config = config
+        self.backend_name = resolve_rwkv7_backend_name(config)
+        self.config.language_model_backend = self.backend_name
         self.hidden_size = config.hidden_size
         self.num_layers = config.num_hidden_layers
 
         self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            [RWKV7Block(config, layer_idx) for layer_idx in range(self.num_layers)]
+            [
+                build_rwkv7_block(
+                    config,
+                    layer_idx,
+                    backend_name=self.backend_name,
+                )
+                for layer_idx in range(self.num_layers)
+            ]
         )
 
         use_fuse = getattr(config, "fuse_norm", False)
@@ -247,7 +283,14 @@ class RWKV7VLForConditionalGeneration(nn.Module):
         if isinstance(text_config, dict):
             text_config = RWKV7Config(**text_config)
 
-        vision_config = config.vision_config
+        selected_lm_backend = getattr(config, "language_model_backend", None)
+        if selected_lm_backend is None:
+            selected_lm_backend = getattr(config, "rwkv7_backend", None)
+        if selected_lm_backend is not None:
+            text_config.language_model_backend = selected_lm_backend
+
+        vision_config = _normalize_vision_config(config.vision_config)
+        config.vision_config = vision_config
         proj_cfg = config.projector_config
         if isinstance(proj_cfg, dict):
             encoder_dim = proj_cfg["encoder_dim"]
@@ -268,7 +311,8 @@ class RWKV7VLForConditionalGeneration(nn.Module):
             config.num_attention_heads = getattr(text_config, "num_heads", 16)
 
         self.config = config
-        self.visual = Qwen3_5VisionModel(vision_config)
+        self.vision_config = vision_config
+        self.visual = Qwen3VLMoeVisionModel(vision_config)
         self.proj = VisualAdapter(encoder_dim, project_dim, hidden_dim)
         self.model = RWKV7LanguageModel(text_config)
         self.lm_head = nn.Linear(
@@ -300,10 +344,14 @@ class RWKV7VLForConditionalGeneration(nn.Module):
         vis_device = next(self.visual.parameters()).device
         vis_dtype = next(self.visual.parameters()).dtype
         pixel_values = pixel_values.to(device=vis_device, dtype=vis_dtype)
-        image_grid_thw = image_grid_thw.to(device=vis_device)
+        # SGLang's Qwen3 vision path computes cu_seqlens from a NumPy view and
+        # expects grid_thw to remain on CPU.
+        image_grid_thw = image_grid_thw.to(device="cpu")
 
-        vision_output = self.visual(pixel_values, image_grid_thw)
-        if (
+        vision_output = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if isinstance(vision_output, torch.Tensor):
+            vision_embeds = vision_output
+        elif (
             hasattr(vision_output, "pooler_output")
             and vision_output.pooler_output is not None
         ):
@@ -317,7 +365,7 @@ class RWKV7VLForConditionalGeneration(nn.Module):
         else:
             vision_embeds = vision_output[0]
 
-        merge = getattr(self.visual.config, "spatial_merge_size", 2)
+        merge = getattr(self.vision_config, "spatial_merge_size", 2)
         split_sizes = (image_grid_thw.prod(-1) // (merge**2)).tolist()
         embeds_list = torch.split(vision_embeds, split_sizes)
 
@@ -362,7 +410,8 @@ class RWKV7VLForConditionalGeneration(nn.Module):
     @staticmethod
     def _map_weight_name(name: str) -> str:
         if name.startswith("model.encoder."):
-            return "visual." + name[len("model.encoder.") :]
+            mapped_name = "visual." + name[len("model.encoder.") :]
+            return mapped_name.replace(".attn.qkv.", ".attn.qkv_proj.")
         if name.startswith("model.proj."):
             return "proj." + name[len("model.proj.") :]
         if name.startswith("model.llm."):
