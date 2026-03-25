@@ -20,7 +20,7 @@ from fla.models.rwkv7 import RWKV7Config
 from rwkv7_backend import (
     RWKV7SGLangCache,
     build_rwkv7_block,
-    resolve_rwkv7_backend_name,
+    resolve_rwkv7_backend_names,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,8 +76,16 @@ class RWKV7LanguageModel(nn.Module):
     def __init__(self, config: RWKV7Config):
         super().__init__()
         self.config = config
-        self.backend_name = resolve_rwkv7_backend_name(config)
-        self.config.language_model_backend = self.backend_name
+        self.prefill_backend_name, self.decode_backend_name = resolve_rwkv7_backend_names(config)
+        self.backend_name = (
+            self.prefill_backend_name
+            if self.prefill_backend_name == self.decode_backend_name
+            else f"{self.prefill_backend_name}/{self.decode_backend_name}"
+        )
+        if self.prefill_backend_name == self.decode_backend_name:
+            self.config.language_model_backend = self.prefill_backend_name
+        self.config.rwkv7_prefill_backend = self.prefill_backend_name
+        self.config.rwkv7_decode_backend = self.decode_backend_name
         self.hidden_size = config.hidden_size
         self.num_layers = config.num_hidden_layers
 
@@ -87,7 +95,8 @@ class RWKV7LanguageModel(nn.Module):
                 build_rwkv7_block(
                     config,
                     layer_idx,
-                    backend_name=self.backend_name,
+                    prefill_backend_name=self.prefill_backend_name,
+                    decode_backend_name=self.decode_backend_name,
                 )
                 for layer_idx in range(self.num_layers)
             ]
@@ -190,6 +199,7 @@ class RWKV7LanguageModel(nn.Module):
                 cache=track_cache,
                 v_first=v_first,
                 cu_seqlens=cu_seqlens,
+                backend_phase="prefill",
                 **kwargs,
             )
 
@@ -224,6 +234,7 @@ class RWKV7LanguageModel(nn.Module):
         )
 
         if is_extend:
+            backend_phase = "prefill"
             self._track_extend_prefix_states(
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
@@ -240,6 +251,7 @@ class RWKV7LanguageModel(nn.Module):
             ).cumsum(0)
             hidden_states = hidden_states.unsqueeze(0)
         else:
+            backend_phase = "decode"
             cu_seqlens = None
             hidden_states = hidden_states.unsqueeze(1)
 
@@ -250,6 +262,7 @@ class RWKV7LanguageModel(nn.Module):
                 cache=cache,
                 v_first=v_first,
                 cu_seqlens=cu_seqlens,
+                backend_phase=backend_phase,
                 **kwargs,
             )
 
@@ -283,11 +296,15 @@ class RWKV7VLForConditionalGeneration(nn.Module):
         if isinstance(text_config, dict):
             text_config = RWKV7Config(**text_config)
 
-        selected_lm_backend = getattr(config, "language_model_backend", None)
-        if selected_lm_backend is None:
-            selected_lm_backend = getattr(config, "rwkv7_backend", None)
-        if selected_lm_backend is not None:
-            text_config.language_model_backend = selected_lm_backend
+        for attr in (
+            "language_model_backend",
+            "rwkv7_backend",
+            "rwkv7_prefill_backend",
+            "rwkv7_decode_backend",
+        ):
+            value = getattr(config, attr, None)
+            if value is not None:
+                setattr(text_config, attr, value)
 
         vision_config = _normalize_vision_config(config.vision_config)
         config.vision_config = vision_config
