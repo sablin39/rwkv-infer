@@ -11,4 +11,5 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" exec "${PYTHON_BIN}" -m sglang
   --host "${HOST}" \
   --port "${PORT}" \
   --tensor-parallel-size "${TP:-1}" \
+  --mm-attention-backend fa4 \
   "$@"

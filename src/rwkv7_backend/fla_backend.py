@@ -18,10 +18,9 @@ from fla.ops.rwkv7.gate_output_correction import gate_output_correction
 
 from .cache import RWKV7LayerState, RWKV7SGLangCache
 
-try:
-    from transformers.modeling_layers import GradientCheckpointingLayer
-except ImportError:
-    from fla.models.modeling_layers import GradientCheckpointingLayer
+
+from transformers.modeling_layers import GradientCheckpointingLayer
+
 
 
 class RWKV7Attention(nn.Module):
