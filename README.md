@@ -44,6 +44,38 @@ export SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=rwkv7vl_processor
 
 The same launch flow is also wrapped in `./benchmarks/launch_server.sh`.
 
+## RWKV7 Backend Selection
+
+RWKV7 recurrent execution now supports split backend selection for prefill and decode.
+The default remains `fla` for both phases.
+
+Environment variables:
+
+- `RWKV7_BACKEND`
+  Shared fallback for both phases.
+- `RWKV7_PREFILL_BACKEND`
+  Prefill-only override.
+- `RWKV7_DECODE_BACKEND`
+  Decode-only override.
+
+Supported values:
+
+- `fla`
+- `jit`
+
+Examples:
+
+```bash
+# Use the JIT backend for both prefill and decode.
+RWKV7_BACKEND=jit ./benchmarks/launch_server.sh
+
+# Keep prefill on FLA but switch decode to JIT.
+RWKV7_PREFILL_BACKEND=fla RWKV7_DECODE_BACKEND=jit ./benchmarks/launch_server.sh
+
+# Use JIT for prefill and keep decode on FLA.
+RWKV7_PREFILL_BACKEND=jit RWKV7_DECODE_BACKEND=fla ./benchmarks/launch_server.sh
+```
+
 ## Benchmarks
 
 The repository includes a small set of ready-to-run helpers under `./benchmarks` for the core server flow: launch the server, drive batched requests, and optionally profile that same serving path. They default to:
@@ -76,6 +108,10 @@ Then use the benchmark scripts from the repo root.
 - `./benchmarks/profile_serving.sh`
   Wraps the same online serving benchmark with `--profile`, so traces come from the exact workload selected via `DATASET_NAME` instead of a separate microbenchmark.
   The launcher exports `SGLANG_TORCH_PROFILER_DIR` by default, so profiling works out of the box when the server is started with `./benchmarks/launch_server.sh`.
+
+- `./benchmarks/bench_rwkv7_jit_ops.py`
+  Directly compares the repo-local RWKV7 JIT recurrent kernels against the current FLA recurrent ops for prefill and decode.
+  This is a focused smoke benchmark for the new backend rather than an end-to-end server benchmark.
 
 Examples:
 

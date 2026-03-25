@@ -4,7 +4,9 @@
 
 - [ ] JIT kernel modified from kernels in [rwkv7_fast_fused](https://github.com/BlinkDL/RWKV-CUDA/tree/main/rwkv7_fast_fused)
 
-- [ ] Attention Backend selection for RWKV. 
+- [x] Attention Backend selection for RWKV. 
+
+- [x] Try to use different backend for prefill and decode. 
 
 - [ ] Huggingface-compatible exporters for RWKV and RWKV-VL.
 
@@ -14,4 +16,3 @@
 
 - [ ] Use the [Qwen3VLMoeVisionModel](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/qwen3_vl.py) instead of hf class.
 
-- [ ] Verify if VLM scheduler feature is used. 
